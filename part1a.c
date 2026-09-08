@@ -107,6 +107,9 @@ int main(int argc, char* argv[]) {
    int loc_part;               /* Current local particle     */
    int output_freq;            /* Frequency of output        */
    int next, previous;         /* Neighbouring ranks in ring */
+   int stage;                  /* Current ring stage */
+   int block_owner;            /* Original owner of current block */
+   int recv_owner;             /* Original owner of received block */
    double delta_t;             /* Size of timestep           */
    double t;                   /* Current Time               */
    double* masses;             /* All the masses             */
@@ -114,6 +117,8 @@ int main(int argc, char* argv[]) {
    vect_t* pos;                /* Positions of all particles */
    vect_t* loc_vel;            /* Velocities of my particles */
    vect_t* loc_forces;         /* Forces on my particles     */
+   vect_t* send_block;
+   vect_t* recv_block;
 
    char g_i;                   /*_G_en or _i_nput init conds */
    double start, finish;       /* For timings                */
@@ -153,8 +158,21 @@ int main(int argc, char* argv[]) {
       for (loc_part = 0; loc_part < loc_n; loc_part++)
          Update_part(loc_part, masses, loc_forces, loc_pos, loc_vel,
                n, loc_n, delta_t);
-      MPI_Allgather(MPI_IN_PLACE, loc_n, vect_mpi_t,
-                    pos, loc_n, vect_mpi_t, comm);
+      block_owner = my_rank;
+
+      for (stage = 1; stage < comm_sz; stage++) {
+         recv_owner = (block_owner - 1 + comm_sz) % comm_sz;
+
+         send_block = pos + block_owner * loc_n;
+         recv_block = pos + recv_owner * loc_n;
+
+         /* Pass the current position block around the ring */
+         MPI_Sendrecv(send_block, loc_n, vect_mpi_t, next, 0,
+                      recv_block, loc_n, vect_mpi_t, previous, 0,
+                      comm, MPI_STATUS_IGNORE);
+
+         block_owner = recv_owner;
+      }
 #     ifndef NO_OUTPUT
       if (step % output_freq == 0)
          Output_state(t, masses, pos, loc_vel, n, loc_n);
