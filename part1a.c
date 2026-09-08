@@ -1,4 +1,4 @@
-/* File:     mpi_nbody_basic.c
+/* File:     part1a.c
  * Purpose:  Part 1A MPI N-body solver using ring communication
  *           for exchanging updated particle positions.
  *
@@ -158,6 +158,7 @@ int main(int argc, char* argv[]) {
       for (loc_part = 0; loc_part < loc_n; loc_part++)
          Update_part(loc_part, masses, loc_forces, loc_pos, loc_vel,
                n, loc_n, delta_t);
+      /* Start each ring pass with this rank's updated position block. */
       block_owner = my_rank;
 
       for (stage = 1; stage < comm_sz; stage++) {
