@@ -70,6 +70,7 @@
 #define DIM 2  /* Two-dimensional system */
 #define X 0    /* x-coordinate subscript */
 #define Y 1    /* y-coordinate subscript */
+#define BODY_DATA_SIZE (DIM + 1)
 
 typedef double vect_t[DIM];  /* Vector type for position, etc. */
 
@@ -119,6 +120,7 @@ int main(int argc, char* argv[]) {
    vect_t* send_block;
    vect_t* recv_block;
    double* loc_masses;         /* Masses of my particles     */
+   double* comm_block;          /* Temporary mass-position block */
 
    char g_i;                   /*_G_en or _i_nput init conds */
    double start, finish;       /* For timings                */
@@ -139,6 +141,7 @@ int main(int argc, char* argv[]) {
    loc_pos = pos + my_rank*loc_n;
    loc_vel = malloc(loc_n*sizeof(vect_t));
    loc_masses = malloc(loc_n*sizeof(double));
+   comm_block = malloc(loc_n * BODY_DATA_SIZE * sizeof(double));
    if (my_rank == 0) vel = malloc(n*sizeof(vect_t));
    MPI_Type_contiguous(DIM, MPI_DOUBLE, &vect_mpi_t);
    MPI_Type_commit(&vect_mpi_t);
@@ -148,9 +151,17 @@ int main(int argc, char* argv[]) {
    else
       Gen_init_cond(masses, pos, loc_vel, n, loc_n);
 
+   /* Copy this rank's masses into local storage */
    memcpy(loc_masses,
        masses + my_rank*loc_n,
        loc_n*sizeof(double));
+
+   /* Pack local mass and position data into the communication block */
+   for (loc_part = 0; loc_part < loc_n; loc_part++) {
+      comm_block[loc_part * BODY_DATA_SIZE] = loc_masses[loc_part];
+      comm_block[loc_part * BODY_DATA_SIZE + 1] = loc_pos[loc_part][X];
+      comm_block[loc_part * BODY_DATA_SIZE + 2] = loc_pos[loc_part][Y];
+   }
 
    start = MPI_Wtime();
 #  ifndef NO_OUTPUT
@@ -195,6 +206,7 @@ int main(int argc, char* argv[]) {
    free(loc_forces);
    free(loc_vel);
    free(loc_masses);
+   free(comm_block);
    if (my_rank == 0) free(vel);
 
    MPI_Finalize();
