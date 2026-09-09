@@ -1,11 +1,11 @@
 /* File:     part1b.c
  * Purpose:  Reduced-memory MPI N-body solver using ring communication.
  *
- * Compile:  mpicc -g -Wall -o mpi_nbody_basic mpi_nbody_basic.c -lm
+ * Compile:  mpicc -g -Wall -o part1b part1b.c -lm
  *           To turn off output (e.g., when timing), define NO_OUTPUT
  *           To get verbose output, define DEBUG
  *
- * Run:      mpiexec -n <number of processes> ./mpi_nbody_basic
+ * Run:      mpiexec -n <number of processes> ./part1b
  *              <number of particles> <number of timesteps>  <size of timestep>
  *              <output frequency> <g|i>
  *              'g': generate initial conditions using a random number
@@ -24,15 +24,14 @@
  *              ignored (but still necessary) if NO_OUTPUT is defined
  *
  *    for each timestep t {
- *       for each particle i I own
- *          compute F(i), the total force on i
- *       for each particle i I own
- *          update position and velocity of i using F(i) = ma
- *       Allgather positions
- *       if (output step) {
- *          Allgather velocities
- *          Output new positions and velocities
- *       }
+ *       pack local masses and positions into a communication block
+ *       initialise local forces
+ *       accumulate forces from the local block
+ *       circulate mass-position blocks through the ring
+ *       accumulate force contributions from each received block
+ *       update locally owned positions and velocities
+ *       if (output step)
+ *          gather positions and velocities to process 0 for output
  *    }
  *
  * Force:    The force on particle i due to particle k is given by
@@ -56,8 +55,9 @@
  * s_i(u) is its position.
  *
  * Notes:
- * 1.  Each process stores the masses of all the particles:  the
- *     masses array has dimension n = number of particles.
+ * 1.  Each process permanently stores only the masses of its locally
+ *     owned particles.  Remote masses and positions are communicated
+ *     temporarily through the ring.
  *
  * IPP:  Section 6.1.9 (pp. 290 and ff.)
  */
@@ -81,7 +81,7 @@ int my_rank, comm_sz;
 MPI_Comm comm;
 MPI_Datatype vect_mpi_t;
 
-/* Scratch array used by process 0 for global velocity I/O */
+/* Scratch array used by process 0 for initial velocity distribution */
 vect_t *vel = NULL;
 
 void Usage(char* prog_name);
@@ -91,14 +91,14 @@ void Get_init_cond(double masses[], vect_t pos[],
      double loc_masses[], vect_t loc_vel[], int n, int loc_n);
 void Gen_init_cond(double masses[], vect_t pos[],
       double loc_masses[], vect_t loc_vel[], int n, int loc_n);
-void Output_state(double time, double masses[], vect_t pos[],
+void Output_state(double time, vect_t loc_pos[],
       vect_t loc_vel[], int n, int loc_n);
 void Compute_force(int loc_part, double masses[], vect_t loc_forces[],
       vect_t pos[], int n, int loc_n);
 void Accumulate_force_block(int loc_part, double loc_masses[],
       vect_t loc_pos[], vect_t loc_forces[], double comm_block[],
       int block_owner, int loc_n);
-void Update_part(int loc_part, double masses[], vect_t loc_forces[],
+void Update_part(int loc_part, double loc_masses[], vect_t loc_forces[],
       vect_t loc_pos[], vect_t loc_vel[], int n, int loc_n, double delta_t);
 
 /*--------------------------------------------------------------------*/
@@ -115,7 +115,7 @@ int main(int argc, char* argv[]) {
    int recv_owner;             /* Original owner of received block */
    double delta_t;             /* Size of timestep           */
    double t;                   /* Current Time               */
-   double* masses = NULL;      /* All the masses             */
+   double* masses = NULL;      /* Root-only temporary global masses */
    vect_t* loc_pos;            /* Positions of my particles  */
    vect_t* pos;                /* Positions of all particles */
    vect_t* loc_vel;            /* Velocities of my particles */
@@ -159,7 +159,7 @@ int main(int argc, char* argv[]) {
 
    start = MPI_Wtime();
 #  ifndef NO_OUTPUT
-   Output_state(0.0, masses, pos, loc_vel, n, loc_n);
+   Output_state(0.0, loc_pos, loc_vel, n, loc_n);
 #  endif
    for (step = 1; step <= n_steps; step++) {
       t = step*delta_t;
@@ -239,7 +239,7 @@ int main(int argc, char* argv[]) {
       }
 #     ifndef NO_OUTPUT
       if (step % output_freq == 0)
-         Output_state(t, masses, pos, loc_vel, n, loc_n);
+         Output_state(t, loc_pos, loc_vel, n, loc_n);
 #     endif
    }
 
@@ -343,9 +343,10 @@ void Get_args(int argc, char* argv[], int* n_p, int* n_steps_p,
  *    n:       total number of particles
  *    loc_n:   number of particles assigned to this process
  * Out args:
- *    masses:  global array of the masses of the particles
- *    pos:     global array of positions
- *    loc_vel: local array of velocities assigned to this process.
+ *    masses:      root-only temporary array of all particle masses
+ *    pos:         global array of particle positions
+ *    loc_masses:  local masses assigned to this process
+ *    loc_vel:     local velocities assigned to this process
  *
  * Global var:
  *    vel:     Scratch.  Used by process 0 for global velocities
@@ -381,9 +382,10 @@ void Get_init_cond(double masses[], vect_t pos[], double loc_masses[],
  *    n:       total number of particles
  *    loc_n:   number of particles assigned to this process
  * Out args:
- *    masses:  global array of the masses of the particles
- *    pos:     global array of positions
- *    loc_vel: local array of velocities assigned to this process.
+ *    masses:      root-only temporary array of all particle masses
+ *    pos:         global array of particle positions
+ *    loc_masses:  local masses assigned to this process
+ *    loc_vel:     local velocities assigned to this process
  * Global var:
  *    vel:     Scratch.  Used by process 0 for global velocities
  *
@@ -428,29 +430,49 @@ void Gen_init_cond(double masses[], vect_t pos[], double loc_masses[],
  * Function:   Output_state
  * Purpose:    Print the current state of the system
  * In args:
- *    time:    current time
- *    masses:  global array of particle masses
- *    pos:     global array of particle positions
- *    loc_vel: local array of my particle velocities
- *    n:       total number of particles
- *    loc_n:   number of my particles
+ *    time:     current time
+ *    loc_pos:  local positions owned by this process
+ *    loc_vel:  local velocities owned by this process
+ *    n:        total number of particles
+ *    loc_n:    number of particles owned by this process
+ *
+ * Note:
+ *    Complete positions and velocities are gathered temporarily on
+ *    process 0 only when output is required.
  */
-void Output_state(double time, double masses[], vect_t pos[],
+void Output_state(double time, vect_t loc_pos[],
       vect_t loc_vel[], int n, int loc_n) {
-   int part;
 
-   MPI_Gather(loc_vel, loc_n, vect_mpi_t, vel, loc_n, vect_mpi_t,
-         0, comm);
+   int part;
+   vect_t* all_pos = NULL;
+   vect_t* all_vel = NULL;
+
+   /* Root temporarily collects complete output data */
+   if (my_rank == 0) {
+      all_pos = malloc(n * sizeof(vect_t));
+      all_vel = malloc(n * sizeof(vect_t));
+   }
+
+   MPI_Gather(loc_pos, loc_n, vect_mpi_t,
+         all_pos, loc_n, vect_mpi_t, 0, comm);
+
+   MPI_Gather(loc_vel, loc_n, vect_mpi_t,
+         all_vel, loc_n, vect_mpi_t, 0, comm);
+
    if (my_rank == 0) {
       printf("%.2f\n", time);
+
       for (part = 0; part < n; part++) {
-//       printf("%.3f ", masses[part]);
-         printf("%3d %10.3e ", part, pos[part][X]);
-         printf("  %10.3e ", pos[part][Y]);
-         printf("  %10.3e ", vel[part][X]);
-         printf("  %10.3e\n", vel[part][Y]);
+         printf("%3d %10.3e ", part, all_pos[part][X]);
+         printf("  %10.3e ", all_pos[part][Y]);
+         printf("  %10.3e ", all_vel[part][X]);
+         printf("  %10.3e\n", all_vel[part][Y]);
       }
+
       printf("\n");
+
+      free(all_pos);
+      free(all_vel);
    }
 }  /* Output_state */
 
@@ -572,7 +594,7 @@ void Accumulate_force_block(int loc_part, double loc_masses[],
  * Purpose:   Update the velocity and position for particle loc_part
  * In args:
  *    loc_part:    local index of the particle we're updating
- *    masses:      global array of particle masses
+ *    loc_masses:  local masses owned by this process
  *    loc_forces:  local array of total forces
  *    n:           total number of particles
  *    loc_n:       number of particles assigned to this process
