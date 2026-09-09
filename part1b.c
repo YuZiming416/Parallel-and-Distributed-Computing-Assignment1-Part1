@@ -95,6 +95,9 @@ void Output_state(double time, double masses[], vect_t pos[],
       vect_t loc_vel[], int n, int loc_n);
 void Compute_force(int loc_part, double masses[], vect_t loc_forces[],
       vect_t pos[], int n, int loc_n);
+void Accumulate_force_block(int loc_part, double loc_masses[],
+      vect_t loc_pos[], vect_t loc_forces[], double comm_block[],
+      int block_owner, int loc_n);
 void Update_part(int loc_part, double masses[], vect_t loc_forces[],
       vect_t loc_pos[], vect_t loc_vel[], int n, int loc_n, double delta_t);
 
@@ -156,19 +159,19 @@ int main(int argc, char* argv[]) {
        masses + my_rank*loc_n,
        loc_n*sizeof(double));
 
-   /* Pack local mass and position data into the communication block */
-   for (loc_part = 0; loc_part < loc_n; loc_part++) {
-      comm_block[loc_part * BODY_DATA_SIZE] = loc_masses[loc_part];
-      comm_block[loc_part * BODY_DATA_SIZE + 1] = loc_pos[loc_part][X];
-      comm_block[loc_part * BODY_DATA_SIZE + 2] = loc_pos[loc_part][Y];
-   }
-
    start = MPI_Wtime();
 #  ifndef NO_OUTPUT
    Output_state(0.0, masses, pos, loc_vel, n, loc_n);
 #  endif
    for (step = 1; step <= n_steps; step++) {
       t = step*delta_t;
+
+      /* Pack current local body data for ring communication */
+      for (loc_part = 0; loc_part < loc_n; loc_part++) {
+         comm_block[loc_part * BODY_DATA_SIZE] = loc_masses[loc_part];
+         comm_block[loc_part * BODY_DATA_SIZE + 1] = loc_pos[loc_part][X];
+         comm_block[loc_part * BODY_DATA_SIZE + 2] = loc_pos[loc_part][Y];
+      }
       for (loc_part = 0; loc_part < loc_n; loc_part++)
          Compute_force(loc_part, masses, loc_forces, pos, n, loc_n);
       for (loc_part = 0; loc_part < loc_n; loc_part++)
@@ -467,6 +470,56 @@ void Compute_force(int loc_part, double masses[], vect_t loc_forces[],
    }
 }  /* Compute_force */
 
+/*---------------------------------------------------------------------
+ * Function:  Accumulate_force_block
+ * Purpose:   Accumulate force contributions from one communicated block.
+ */
+void Accumulate_force_block(int loc_part, double loc_masses[],
+      vect_t loc_pos[], vect_t loc_forces[], double comm_block[],
+      int block_owner, int loc_n) {
+
+   int k;
+   int part;
+   int source_part;
+   double source_mass;
+   double source_x, source_y;
+   double mg;
+   double len, len_3, fact;
+   vect_t f_part_k;
+
+   /* Global index of the local target particle */
+   part = my_rank * loc_n + loc_part;
+
+   for (k = 0; k < loc_n; k++) {
+
+      /* Global index of this particle in the communicated block */
+      source_part = block_owner * loc_n + k;
+
+      if (source_part != part) {
+
+         source_mass = comm_block[k * BODY_DATA_SIZE];
+         source_x = comm_block[k * BODY_DATA_SIZE + 1];
+         source_y = comm_block[k * BODY_DATA_SIZE + 2];
+
+         f_part_k[X] = loc_pos[loc_part][X] - source_x;
+         f_part_k[Y] = loc_pos[loc_part][Y] - source_y;
+
+         len = sqrt(f_part_k[X] * f_part_k[X]
+                  + f_part_k[Y] * f_part_k[Y]);
+
+         len_3 = len * len * len;
+
+         mg = -G * loc_masses[loc_part] * source_mass;
+         fact = mg / len_3;
+
+         f_part_k[X] *= fact;
+         f_part_k[Y] *= fact;
+
+         loc_forces[loc_part][X] += f_part_k[X];
+         loc_forces[loc_part][Y] += f_part_k[Y];
+      }
+   }
+}
 
 /*---------------------------------------------------------------------
  * Function:  Update_part
