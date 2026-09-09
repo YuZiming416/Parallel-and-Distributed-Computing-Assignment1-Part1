@@ -2,11 +2,11 @@
  * Purpose:  Part 1A MPI N-body solver using ring communication
  *           for exchanging updated particle positions.
  *
- * Compile:  mpicc -g -Wall -o mpi_nbody_basic mpi_nbody_basic.c -lm
+ * Compile:  mpicc -g -Wall -o part1a part1a.c -lm
  *           To turn off output (e.g., when timing), define NO_OUTPUT
  *           To get verbose output, define DEBUG
  *
- * Run:      mpiexec -n <number of processes> ./mpi_nbody_basic
+ * Run:      mpiexec -n <number of processes> ./part1a
  *              <number of particles> <number of timesteps>  <size of timestep>
  *              <output frequency> <g|i>
  *              'g': generate initial conditions using a random number
@@ -29,10 +29,10 @@
  *          compute F(i), the total force on i
  *       for each particle i I own
  *          update position and velocity of i using F(i) = ma
- *       Allgather positions
+ *       circulate updated position blocks through the ring
  *       if (output step) {
- *          Allgather velocities
- *          Output new positions and velocities
+ *          gather velocities to process 0
+ *          output new positions and velocities
  *       }
  *    }
  *
@@ -57,8 +57,9 @@
  * s_i(u) is its position.
  *
  * Notes:
- * 1.  Each process stores the masses of all the particles:  the
- *     masses array has dimension n = number of particles.
+ * 1.  Each process stores the masses and positions of all particles.
+ *     The updated position blocks are circulated through the ring
+ *     after each timestep to reconstruct the complete position array.
  *
  * IPP:  Section 6.1.9 (pp. 290 and ff.)
  */
@@ -74,7 +75,7 @@
 
 typedef double vect_t[DIM];  /* Vector type for position, etc. */
 
-/* Global variables.  Except or vel all are unchanged after being set */
+/* Global MPI state and datatype information */
 const double G = 6.673e-11;  /* Gravitational constant. */
                              /* Units are m^3/(kg*s^2)  */
 int my_rank, comm_sz;
@@ -117,8 +118,8 @@ int main(int argc, char* argv[]) {
    vect_t* pos;                /* Positions of all particles */
    vect_t* loc_vel;            /* Velocities of my particles */
    vect_t* loc_forces;         /* Forces on my particles     */
-   vect_t* send_block;
-   vect_t* recv_block;
+   vect_t* send_block;         /* Current position block to send */
+   vect_t* recv_block;         /* Destination for received block */
 
    char g_i;                   /*_G_en or _i_nput init conds */
    double start, finish;       /* For timings                */
