@@ -124,6 +124,8 @@ int main(int argc, char* argv[]) {
    vect_t* recv_block;
    double* loc_masses;         /* Masses of my particles     */
    double* comm_block;          /* Temporary mass-position block */
+   double* incoming_block;      /* Received mass-position block */
+   double* temp_block;          /* Used when swapping buffers */
 
    char g_i;                   /*_G_en or _i_nput init conds */
    double start, finish;       /* For timings                */
@@ -146,6 +148,7 @@ int main(int argc, char* argv[]) {
    loc_masses = malloc(loc_n*sizeof(double));
    comm_block = malloc(loc_n * BODY_DATA_SIZE * sizeof(double));
    if (my_rank == 0) vel = malloc(n*sizeof(vect_t));
+   incoming_block = malloc(loc_n * BODY_DATA_SIZE * sizeof(double));
    MPI_Type_contiguous(DIM, MPI_DOUBLE, &vect_mpi_t);
    MPI_Type_commit(&vect_mpi_t);
 
@@ -172,11 +175,57 @@ int main(int argc, char* argv[]) {
          comm_block[loc_part * BODY_DATA_SIZE + 1] = loc_pos[loc_part][X];
          comm_block[loc_part * BODY_DATA_SIZE + 2] = loc_pos[loc_part][Y];
       }
-      for (loc_part = 0; loc_part < loc_n; loc_part++)
-         Compute_force(loc_part, masses, loc_forces, pos, n, loc_n);
+      /* Reset local forces before accumulating contributions */
+      for (loc_part = 0; loc_part < loc_n; loc_part++) {
+         loc_forces[loc_part][X] = 0.0;
+         loc_forces[loc_part][Y] = 0.0;
+      }
+
+      /* First accumulate force from this rank's own block */
+      block_owner = my_rank;
+
+      for (loc_part = 0; loc_part < loc_n; loc_part++) {
+         Accumulate_force_block(loc_part, loc_masses, loc_pos,
+               loc_forces, comm_block, block_owner, loc_n);
+      }
+
+      /* Pass body blocks around the ring */
+      for (stage = 1; stage < comm_sz; stage++) {
+
+         recv_owner = (block_owner - 1 + comm_sz) % comm_sz;
+
+         MPI_Sendrecv(comm_block,
+                     loc_n * BODY_DATA_SIZE,
+                     MPI_DOUBLE,
+                     next,
+                     1,
+                     incoming_block,
+                     loc_n * BODY_DATA_SIZE,
+                     MPI_DOUBLE,
+                     previous,
+                     1,
+                     comm,
+                     MPI_STATUS_IGNORE);
+
+         block_owner = recv_owner;
+
+         /* Accumulate force from the received block */
+         for (loc_part = 0; loc_part < loc_n; loc_part++) {
+            Accumulate_force_block(loc_part, loc_masses, loc_pos,
+                  loc_forces, incoming_block, block_owner, loc_n);
+         }
+
+         /* The received block is forwarded in the next stage */
+         temp_block = comm_block;
+         comm_block = incoming_block;
+         incoming_block = temp_block;
+      }
+
+      /* Update local particles after all force contributions are known */
       for (loc_part = 0; loc_part < loc_n; loc_part++)
          Update_part(loc_part, loc_masses, loc_forces, loc_pos, loc_vel,
                n, loc_n, delta_t);
+
       /* Start each ring pass with this rank's updated position block. */
       block_owner = my_rank;
 
@@ -210,6 +259,7 @@ int main(int argc, char* argv[]) {
    free(loc_vel);
    free(loc_masses);
    free(comm_block);
+   free(incoming_block);
    if (my_rank == 0) free(vel);
 
    MPI_Finalize();
