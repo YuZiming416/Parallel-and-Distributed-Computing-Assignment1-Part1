@@ -549,7 +549,7 @@ void Update_part(int loc_part, double loc_masses[], vect_t loc_forces[],
    double fact;
 
    #  ifdef DEBUG
-   part = my_rank*loc_n + loc_part;
+   int part = my_rank*loc_n + loc_part;
    #  endif
 
    fact = delta_t/loc_masses[loc_part];
