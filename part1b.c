@@ -74,7 +74,7 @@
 
 typedef double vect_t[DIM];  /* Vector type for position, etc. */
 
-/* Global variables.  Except or vel all are unchanged after being set */
+/* Global MPI state and datatype information */
 const double G = 6.673e-11;  /* Gravitational constant. */
                              /* Units are m^3/(kg*s^2)  */
 int my_rank, comm_sz;
@@ -93,8 +93,6 @@ void Gen_init_cond(double masses[], vect_t pos[], double loc_masses[],
     vect_t loc_pos[], vect_t loc_vel[], int n, int loc_n);
 void Output_state(double time, vect_t loc_pos[],
       vect_t loc_vel[], int n, int loc_n);
-void Compute_force(int loc_part, double masses[], vect_t loc_forces[],
-      vect_t pos[], int n, int loc_n);
 void Accumulate_force_block(int loc_part, double loc_masses[],
       vect_t loc_pos[], vect_t loc_forces[], double comm_block[],
       int block_owner, int loc_n);
@@ -338,12 +336,13 @@ void Get_args(int argc, char* argv[], int* n_p, int* n_steps_p,
  *    loc_n:   number of particles assigned to this process
  * Out args:
  *    masses:      root-only temporary array of all particle masses
- *    pos:         global array of particle positions
+ *    pos:         root-only temporary array of all particle positions
  *    loc_masses:  local masses assigned to this process
+ *    loc_pos:     local positions assigned to this process
  *    loc_vel:     local velocities assigned to this process
  *
  * Global var:
- *    vel:     Scratch.  Used by process 0 for global velocities
+ *    vel: Scratch array used by process 0 for initial velocities
  */
 void Get_init_cond(double masses[], vect_t pos[], double loc_masses[], vect_t loc_pos[],
      vect_t loc_vel[], int n, int loc_n) {
@@ -378,11 +377,12 @@ void Get_init_cond(double masses[], vect_t pos[], double loc_masses[], vect_t lo
  *    loc_n:   number of particles assigned to this process
  * Out args:
  *    masses:      root-only temporary array of all particle masses
- *    pos:         global array of particle positions
+ *    pos:         root-only temporary array of all particle positions
  *    loc_masses:  local masses assigned to this process
+ *    loc_pos:     local positions assigned to this process
  *    loc_vel:     local velocities assigned to this process
  * Global var:
- *    vel:     Scratch.  Used by process 0 for global velocities
+ *    vel: Scratch array used by process 0 for initial velocities
  *
  * Note:      The initial conditions place all particles at
  *            equal intervals on the nonnegative x-axis with
@@ -474,67 +474,6 @@ void Output_state(double time, vect_t loc_pos[],
 
 
 /*---------------------------------------------------------------------
- * Function:       Compute_force
- * Purpose:        Compute the total force on particle loc_part.  Don't
- *                 exploit the symmetry (force on particle i due to
- *                 particle k) = -(force on particle k due to particle i)
- * In args:
- *    loc_part:    the particle (local index) on which we're computing
- *                 the total force
- *    masses:      global array of particle masses
- *    pos:         global array of particle positions
- *    n:           total number of particles
- *    loc_n:       number of my particles
- * Out arg:
- *    loc_forces:  array of total forces acting on my particles
- *
- * Note: This function uses the force due to gravitation.  So
- * the force on particle i due to particle k is given by
- *
- *    m_i m_k (s_k - s_i)/|s_k - s_i|^2
- *
- * Here, m_k is the mass of particle k and s_k is its position vector
- * (at time t).
- */
-void Compute_force(int loc_part, double masses[], vect_t loc_forces[],
-      vect_t pos[], int n, int loc_n) {
-   int k, part;
-   double mg;
-   vect_t f_part_k;
-   double len, len_3, fact;
-
-   /* Global index corresponding to loc_part */
-   part = my_rank*loc_n + loc_part;
-   loc_forces[loc_part][X] = loc_forces[loc_part][Y] = 0.0;
-#  ifdef DEBUG
-   printf("Proc %d > Current total force on part %d = (%.3e, %.3e)\n",
-         my_rank, part, loc_forces[loc_part][X],
-         loc_forces[loc_part][Y]);
-#  endif
-   for (k = 0; k < n; k++) {
-      if (k != part) {
-         /* Compute force on part due to k */
-         f_part_k[X] = pos[part][X] - pos[k][X];
-         f_part_k[Y] = pos[part][Y] - pos[k][Y];
-         len = sqrt(f_part_k[X]*f_part_k[X] + f_part_k[Y]*f_part_k[Y]);
-         len_3 = len*len*len;
-         mg = -G*masses[part]*masses[k];
-         fact = mg/len_3;
-         f_part_k[X] *= fact;
-         f_part_k[Y] *= fact;
-#        ifdef DEBUG
-         printf("Proc %d > Force on part %d due to part %d = (%.3e, %.3e)\n",
-               my_rank, part, k, f_part_k[X], f_part_k[Y]);
-#        endif
-
-         /* Add force in to total forces */
-         loc_forces[loc_part][X] += f_part_k[X];
-         loc_forces[loc_part][Y] += f_part_k[Y];
-      }
-   }
-}  /* Compute_force */
-
-/*---------------------------------------------------------------------
  * Function:  Accumulate_force_block
  * Purpose:   Accumulate force contributions from one communicated block.
  */
@@ -606,10 +545,13 @@ void Accumulate_force_block(int loc_part, double loc_masses[],
 void Update_part(int loc_part, double loc_masses[], vect_t loc_forces[],
       vect_t loc_pos[], vect_t loc_vel[], int n, int loc_n,
       double delta_t) {
-   int part;
+
    double fact;
 
+   #  ifdef DEBUG
    part = my_rank*loc_n + loc_part;
+   #  endif
+
    fact = delta_t/loc_masses[loc_part];
 #  ifdef DEBUG
    printf("Proc %d > Before update of %d:\n", my_rank, part);
